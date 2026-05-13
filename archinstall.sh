@@ -451,6 +451,10 @@ format_filesystems() {
     btrfs subvolume create "$MNT"/@home 2>&1 | tee -a "$LOG_FILE"
     log_success "Subvolume @home created"
 
+    log_cmd "btrfs subvolume create $MNT/@snapshots"
+    btrfs subvolume create "$MNT"/@snapshots 2>&1 | tee -a "$LOG_FILE"
+    log_success "Subvolume @snapshots created"
+
     log_debug "Current subvolumes:"
     btrfs subvolume list "$MNT" 2>&1 | tee -a "$LOG_FILE" || true
 
@@ -489,6 +493,14 @@ format_filesystems() {
         return 1
     fi
     log_result "Home mounted with subvol=@home"
+
+    mkdir -p "$MNT/.snapshots"
+    log_cmd "mount -o noatime,compress=zstd,subvol=@snapshots $lv_path $MNT/.snapshots"
+    if ! mount -o noatime,compress=zstd,subvol=@snapshots "$lv_path" "$MNT/.snapshots" 2>&1 | tee -a "$LOG_FILE"; then
+        log_error "Snapshots remount failed"
+        return 1
+    fi
+    log_result "Snapshots mounted with subvol=@snapshots"
 
     mkdir -p "$MNT/boot"
     log_cmd "mount $efi_part $MNT/boot"
@@ -678,7 +690,7 @@ EOF
     configure_pacman "$MNT"
 
     log_debug "Installed packages:"
-    arch-chroot "$MNT" pacman -Q 2>&1 | tee -a "$LOG_FILE" | wc -l | xargs log_debug "Total packages installed:"
+    arch-chroot "$MNT" pacman -Q 2>&1 | tee -a "$LOG_FILE" | wc -l | while read -r count; do log_debug "Total packages installed: $count"; done
 }
 
 ################################################################################
@@ -779,8 +791,9 @@ install_bootloader() {
     cat > "$MNT/boot/loader/entries/arch.conf" <<EOF
 title   Arch Linux
 linux   /vmlinuz-linux
+initrd  /intel-ucode.img
 initrd  /initramfs-linux.img
-options cryptdevice=UUID=$luks_uuid:$LUKS_NAME root=/dev/$VG_NAME/$LV_NAME rootflags=subvol=@ rw
+options cryptdevice=UUID=$luks_uuid:$LUKS_NAME root=/dev/$VG_NAME/$LV_NAME rootflags=subvol=@ rw nvidia-drm.modeset=1
 EOF
 
     log_debug "Bootloader entry content:"
@@ -875,6 +888,9 @@ compression-algorithm = $ZRAM_ALGORITHM
 swap-priority = 100
 EOF
 
+    log_cmd "arch-chroot $MNT systemctl enable systemd-zram-setup@zram0.service"
+    arch-chroot "$MNT" systemctl enable systemd-zram-setup@zram0.service 2>&1 | tee -a "$LOG_FILE" || true
+
     log_success "zram configured"
 }
 
@@ -894,11 +910,20 @@ setup_snapper() {
     log_debug "Btrfs default subvolume:"
     btrfs subvolume get-default "$MNT" 2>&1 | tee -a "$LOG_FILE" || true
 
+    if mountpoint -q "$MNT/.snapshots"; then
+        umount "$MNT/.snapshots" || true
+    fi
+    rm -rf "$MNT/.snapshots" || true
+
     log_cmd "arch-chroot $MNT snapper -c root create-config /"
     if ! arch-chroot "$MNT" /bin/bash -c "snapper -c root create-config /" 2>&1 | tee -a "$LOG_FILE"; then
         log_error "Failed to create snapper root config"
         return 1
     fi
+
+    arch-chroot "$MNT" btrfs subvolume delete /.snapshots || true
+    mkdir -p "$MNT/.snapshots"
+    mount -a --target "$MNT/.snapshots" || mount -o noatime,compress=zstd,subvol=@snapshots "/dev/$VG_NAME/$LV_NAME" "$MNT/.snapshots" || true
 
     log_cmd "arch-chroot $MNT snapper -c home create-config /home"
     if ! arch-chroot "$MNT" /bin/bash -c "snapper -c home create-config /home" 2>&1 | tee -a "$LOG_FILE"; then
