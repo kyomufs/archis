@@ -189,40 +189,6 @@ confirm() {
     [[ "$yn" =~ [Yy] ]]
 }
 
-    local pacman_conf_file="$pacman_config_dir/pacman.conf"
-    local mirrorlist_file="$pacman_config_dir/mirrorlist"
-    cp /etc/pacman.conf "$pacman_conf_file"
-
-    configure_mirrors "$mirrorlist_file"
-
-    if grep -q '^#Color' "$pacman_conf_file"; then
-        sed -i 's/^#Color/Color/' "$pacman_conf_file"
-    elif ! grep -q '^Color' "$pacman_conf_file"; then
-        printf '\nColor\n' >> "$pacman_conf_file"
-    fi
-
-    if grep -q '^#\[multilib\]' "$pacman_conf_file"; then
-        sed -i '/^#\[multilib\]/s/^#//' "$pacman_conf_file"
-    fi
-
-    sed -i "s|^#Include = /etc/pacman.d/mirrorlist|Include = $mirrorlist_file|" "$pacman_conf_file"
-    sed -i "s|^Include = /etc/pacman.d/mirrorlist|Include = $mirrorlist_file|" "$pacman_conf_file"
-
-    mkdir -p "$MNT/var/cache/pacman/pkg"
-log_cmd() {
-    echo -e "\033[37m[CMD]\033[0m $*" | tee -a "$LOG_FILE"
-}
-
-log_result() {
-    local status=$?
-        if pacman --config "$pacman_conf_file" -Si "$pkg" &>/dev/null; then
-        log_success "$1"
-    else
-        log_error "$1 (exit code: $status)"
-        return "$status"
-    fi
-}
-
 require_root() {
     if [[ $EUID -ne 0 ]]; then
         log_error "This script must be run as root"
