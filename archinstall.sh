@@ -643,6 +643,7 @@ install_base_system() {
 
     local pacman_conf_file="$pacman_config_dir/pacman.conf"
     local mirrorlist_file="$pacman_config_dir/mirrorlist"
+    local pacman_wrapper_dir="$pacman_config_dir/bin"
     cp /etc/pacman.conf "$pacman_conf_file"
 
     configure_mirrors "$mirrorlist_file"
@@ -655,12 +656,26 @@ install_base_system() {
 
     if grep -q '^#\[multilib\]' "$pacman_conf_file"; then
         sed -i '/^#\[multilib\]/s/^#//' "$pacman_conf_file"
+    elif ! grep -q '^\[multilib\]' "$pacman_conf_file"; then
+        cat >> "$pacman_conf_file" <<EOF
+
+[multilib]
+Include = $mirrorlist_file
+EOF
     fi
 
-    sed -i "s|^#Include = /etc/pacman.d/mirrorlist|Include = $mirrorlist_file|" "$pacman_conf_file"
-    sed -i "s|^Include = /etc/pacman.d/mirrorlist|Include = $mirrorlist_file|" "$pacman_conf_file"
+    if ! grep -q '^Include = ' "$pacman_conf_file"; then
+        sed -i "s|^#Include = /etc/pacman.d/mirrorlist|Include = $mirrorlist_file|" "$pacman_conf_file"
+        sed -i "s|^Include = /etc/pacman.d/mirrorlist|Include = $mirrorlist_file|" "$pacman_conf_file"
+    fi
 
     mkdir -p "$MNT/var/cache/pacman/pkg"
+    mkdir -p "$pacman_wrapper_dir"
+    cat > "$pacman_wrapper_dir/pacman" <<EOF
+#!/usr/bin/env bash
+exec /usr/bin/pacman --noconfirm --cachedir "$MNT/var/cache/pacman/pkg" "\$@"
+EOF
+    chmod +x "$pacman_wrapper_dir/pacman"
 
     # Filter available packages
     log_info "Filtering available packages..."
@@ -688,8 +703,11 @@ install_base_system() {
 
     log_cmd "pacstrap $MNT ${available[@]}"
     log_info "Running pacstrap with ${#available[@]} packages..."
-    pacstrap -c -K -C "$pacman_conf_file" "$MNT" "${available[@]}" 2>&1 | tee -a "$LOG_FILE"
-    log_result "Base system installed"
+    if ! PATH="$pacman_wrapper_dir:$PATH" pacstrap -c -K -C "$pacman_conf_file" "$MNT" "${available[@]}" 2>&1 | tee -a "$LOG_FILE"; then
+        log_error "Failed to install base system"
+        return 1
+    fi
+    log_success "Base system installed"
 
     configure_pacman "$MNT"
 
