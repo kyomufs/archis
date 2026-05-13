@@ -281,11 +281,11 @@ prepare_pacman_config() {
         log_cmd "reflector --latest 20 --protocol https --sort rate --save $mirrorlist_file"
         if ! reflector --latest 20 --protocol https --sort rate --save "$mirrorlist_file" 2>&1 | tee -a "$LOG_FILE"; then
             log_warn "reflector failed, falling back to existing mirrorlist"
-            awk 'BEGIN{section=0} /^\[options\]/{section=1; next} /^\[/{section=0} section==0 && ($1 ~ /^#/ || $1 ~ /^Server=/) { print }' /etc/pacman.d/mirrorlist > "$mirrorlist_file"
+            awk '/^Server=/' /etc/pacman.d/mirrorlist > "$mirrorlist_file"
         fi
     else
         log_warn "reflector not available, using sanitized host mirrorlist"
-        awk 'BEGIN{section=0} /^\[options\]/{section=1; next} /^\[/{section=0} section==0 && ($1 ~ /^#/ || $1 ~ /^Server=/) { print }' /etc/pacman.d/mirrorlist > "$mirrorlist_file"
+        awk '/^Server=/' /etc/pacman.d/mirrorlist > "$mirrorlist_file"
     fi
 
     if grep -q '^#Color' "$config_file"; then
@@ -296,6 +296,7 @@ prepare_pacman_config() {
 
     if grep -q '^#\[multilib\]' "$config_file"; then
         sed -i '/^#\[multilib\]/s/^#//' "$config_file"
+        sed -i '/^\[multilib\]/{n; s/^#Include/Include/}' "$config_file"
     elif ! grep -q '^\[multilib\]' "$config_file"; then
         cat >> "$config_file" <<EOF
 
@@ -533,7 +534,8 @@ generate_fstab() {
 
     log_cmd "genfstab -U $MNT"
     log_info "Generating fstab with UUIDs..."
-    genfstab -U "$MNT" 2>&1 | tee -a "$LOG_FILE" > "$MNT/etc/fstab.tmp"
+    genfstab -U "$MNT" > "$MNT/etc/fstab.tmp" 2>&1
+    tee -a "$LOG_FILE" < "$MNT/etc/fstab.tmp" > /dev/null
 
     log_debug "Removing swap entries (if any)..."
     sed '/swap/d' "$MNT/etc/fstab.tmp" > "$MNT/etc/fstab"
@@ -573,6 +575,8 @@ configure_pacman() {
 
     if grep -q '^#\[multilib\]' "$pacman_conf"; then
         sed -i '/^#\[multilib\]/s/^#//' "$pacman_conf"
+        # Also uncomment the Include line right after [multilib]
+        sed -i '/^\[multilib\]/{n; s/^#Include/Include/}' "$pacman_conf"
     fi
 
     if grep -q '^#Include = /etc/pacman.d/mirrorlist' "$pacman_conf"; then
@@ -605,7 +609,7 @@ configure_mirrors() {
         log_warn "reflector not available, using sanitized mirrorlist"
     fi
 
-    awk 'BEGIN{section=0} /^\[options\]/{section=1; next} /^\[/{section=0} section==0 && ($1 ~ /^#/ || $1 ~ /^Server=/) { print }' /etc/pacman.d/mirrorlist > "$mirrorlist_path"
+    awk '/^Server=/' /etc/pacman.d/mirrorlist > "$mirrorlist_path"
     log_success "Mirrorlist updated"
 }
 
@@ -617,13 +621,13 @@ install_base_system() {
         return 0
     fi
 
-    local pacman_config_dir
+    local pacman_config_dir pacman_conf_file mirrorlist_file pacman_wrapper_dir
     pacman_config_dir="$(mktemp -d)"
-    trap 'rm -rf "$pacman_config_dir"' RETURN
+    trap '[[ -d "${pacman_config_dir:-}" ]] && rm -rf "$pacman_config_dir"' RETURN
 
-    local pacman_conf_file="$pacman_config_dir/pacman.conf"
-    local mirrorlist_file="$pacman_config_dir/mirrorlist"
-    local pacman_wrapper_dir="$pacman_config_dir/bin"
+    pacman_conf_file="$pacman_config_dir/pacman.conf"
+    mirrorlist_file="$pacman_config_dir/mirrorlist"
+    pacman_wrapper_dir="$pacman_config_dir/bin"
     cp /etc/pacman.conf "$pacman_conf_file"
 
     configure_mirrors "$mirrorlist_file"
@@ -636,6 +640,7 @@ install_base_system() {
 
     if grep -q '^#\[multilib\]' "$pacman_conf_file"; then
         sed -i '/^#\[multilib\]/s/^#//' "$pacman_conf_file"
+        sed -i '/^\[multilib\]/{n; s/^#Include/Include/}' "$pacman_conf_file"
     elif ! grep -q '^\[multilib\]' "$pacman_conf_file"; then
         cat >> "$pacman_conf_file" <<EOF
 
@@ -648,12 +653,9 @@ EOF
     sed -i "s|^Include = /etc/pacman.d/mirrorlist|Include = $mirrorlist_file|" "$pacman_conf_file"
 
     mkdir -p "$MNT/var/cache/pacman/pkg"
-    mkdir -p "$pacman_wrapper_dir"
-    cat > "$pacman_wrapper_dir/pacman" <<EOF
-#!/usr/bin/env bash
-exec /usr/bin/pacman --noconfirm --cachedir "$MNT/var/cache/pacman/pkg" "\$@"
-EOF
-    chmod +x "$pacman_wrapper_dir/pacman"
+    # Clear potentially corrupted packages from previous runs
+    log_info "Clearing package cache to avoid stale/corrupted packages..."
+    rm -f "$MNT/var/cache/pacman/pkg"/*.pkg.tar.* 2>/dev/null || true
 
     # Filter available packages
     log_info "Filtering available packages..."
@@ -679,9 +681,23 @@ EOF
         return 1
     fi
 
-    log_cmd "pacstrap $MNT ${available[@]}"
+    log_cmd "pacstrap $MNT ${available[*]}"
     log_info "Running pacstrap with ${#available[@]} packages..."
-    if ! PATH="$pacman_wrapper_dir:$PATH" pacstrap -c -K -C "$pacman_conf_file" "$MNT" "${available[@]}" 2>&1 | tee -a "$LOG_FILE"; then
+    local pacstrap_attempts=3
+    local pacstrap_ok=0
+    for attempt in $(seq 1 "$pacstrap_attempts"); do
+        if pacstrap -c -K -C "$pacman_conf_file" "$MNT" "${available[@]}" 2>&1 | tee -a "$LOG_FILE"; then
+            pacstrap_ok=1
+            break
+        fi
+        if [[ $attempt -lt $pacstrap_attempts ]]; then
+            log_warn "pacstrap attempt $attempt failed, retrying in 5s..."
+            sleep 5
+            # Refresh keyring before retry to fix signature issues
+            pacman-key --refresh-keys 2>&1 | tee -a "$LOG_FILE" || true
+        fi
+    done
+    if [[ $pacstrap_ok -eq 0 ]]; then
         log_error "Failed to install base system"
         return 1
     fi
