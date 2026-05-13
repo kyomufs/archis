@@ -697,8 +697,8 @@ EOF
         if [[ $attempt -lt $pacstrap_attempts ]]; then
             log_warn "pacstrap attempt $attempt failed, retrying in 5s..."
             sleep 5
-            # Refresh keyring before retry to fix signature issues
-            pacman-key --refresh-keys 2>&1 | tee -a "$LOG_FILE" || true
+            # Remove any corrupted cached packages before retry
+            rm -f "$MNT/var/cache/pacman/pkg"/*.pkg.tar.* 2>/dev/null || true
         fi
     done
     if [[ $pacstrap_ok -eq 0 ]]; then
