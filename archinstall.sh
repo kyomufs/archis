@@ -75,10 +75,10 @@ PACKAGES=(
   xdg-desktop-portal-hyprland xdg-desktop-portal-gtk xdg-utils egl-wayland
 
   # Terminal & Editors
-  kitty nvim nano
+    kitty neovim nano
 
   # File Manager & Archive
-  dolphin p7zip tar gzip pigz
+    dolphin 7zip tar gzip pigz
 
   # Theming
   nwg-look qt5ct qt6ct
@@ -87,13 +87,13 @@ PACKAGES=(
   grim slurp
 
   # Applications
-  zen-browser gwenview btop openssh gnome-keyring
+    firefox gwenview btop openssh gnome-keyring
 
   # GPU Support (NVIDIA + Intel)
   nvidia-open-dkms nvidia-utils nvidia-settings lib32-nvidia-utils libva-nvidia-driver
   nvidia-prime switcheroo-control acpi_call
   mesa vulkan-intel intel-media-driver lib32-mesa lib32-vulkan-intel intel-ucode
-  mesa-utils vulkan-tools envycontrol
+    mesa-utils vulkan-tools
 
   # zram
   zram-generator
@@ -103,6 +103,8 @@ PACKAGES=(
 DRY_RUN=0
 ASSUME_YES=0
 VERBOSE=0
+
+[[ $VERBOSE -eq 1 ]] && set -x
 
 ################################################################################
 # LOGGING & OUTPUT
@@ -141,11 +143,83 @@ log_cmd() {
 }
 
 log_result() {
-    if [[ $? -eq 0 ]]; then
+    local status=$?
+    if [[ $status -eq 0 ]]; then
         log_success "$1"
     else
-        log_error "$1 (exit code: $?)"
-        return 1
+        log_error "$1 (exit code: $status)"
+        return "$status"
+    fi
+}
+
+require_root() {
+    if [[ $EUID -ne 0 ]]; then
+        log_error "This script must be run as root"
+        exit 1
+    fi
+}
+
+log_config() {
+    log_header "Installation Configuration"
+    log_debug "DISK: $DISK"
+    log_debug "LUKS_NAME: $LUKS_NAME"
+    log_debug "VG_NAME: $VG_NAME"
+    log_debug "LV_NAME: $LV_NAME"
+    log_debug "KEYMAP: $KEYMAP"
+    log_debug "LOCALE: $LOCALE"
+    log_debug "TIMEZONE: $TIMEZONE"
+    log_debug "HOSTNAME: $HOSTNAME"
+    log_debug "USER_NAME: $USER_NAME"
+    log_debug "ZRAM_ALGORITHM: $ZRAM_ALGORITHM"
+    log_debug "FAILLOCK_DENY: $FAILLOCK_DENY"
+    log_debug "FAILLOCK_UNLOCK_TIME: $FAILLOCK_UNLOCK_TIME"
+    log_debug "MNT: $MNT"
+    log_debug "LOG_FILE: $LOG_FILE"
+    log_debug "DRY_RUN: $DRY_RUN"
+    log_debug "ASSUME_YES: $ASSUME_YES"
+}
+
+confirm() {
+    local msg="$1"
+    if [[ $DRY_RUN -eq 1 ]]; then
+        log_info "DRY-RUN: assuming yes for: $msg"
+        return 0
+    fi
+    read -rp "$msg [y/N]: " yn
+    [[ "$yn" =~ [Yy] ]]
+}
+
+    local pacman_conf_file="$pacman_config_dir/pacman.conf"
+    local mirrorlist_file="$pacman_config_dir/mirrorlist"
+    cp /etc/pacman.conf "$pacman_conf_file"
+
+    configure_mirrors "$mirrorlist_file"
+
+    if grep -q '^#Color' "$pacman_conf_file"; then
+        sed -i 's/^#Color/Color/' "$pacman_conf_file"
+    elif ! grep -q '^Color' "$pacman_conf_file"; then
+        printf '\nColor\n' >> "$pacman_conf_file"
+    fi
+
+    if grep -q '^#\[multilib\]' "$pacman_conf_file"; then
+        sed -i '/^#\[multilib\]/s/^#//' "$pacman_conf_file"
+    fi
+
+    sed -i "s|^#Include = /etc/pacman.d/mirrorlist|Include = $mirrorlist_file|" "$pacman_conf_file"
+    sed -i "s|^Include = /etc/pacman.d/mirrorlist|Include = $mirrorlist_file|" "$pacman_conf_file"
+
+    mkdir -p "$MNT/var/cache/pacman/pkg"
+log_cmd() {
+    echo -e "\033[37m[CMD]\033[0m $*" | tee -a "$LOG_FILE"
+}
+
+log_result() {
+    local status=$?
+        if pacman --config "$pacman_conf_file" -Si "$pkg" &>/dev/null; then
+        log_success "$1"
+    else
+        log_error "$1 (exit code: $status)"
+        return "$status"
     fi
 }
 
@@ -244,11 +318,60 @@ preflight_checks() {
 partition_suffix() {
     local disk="$1"
     local bn=$(basename "$disk")
-    if [[ "$bn" =~ nvme|mmcblk|loop ]]; then
-        echo "p"
-    else
-        echo ""
+    case "$bn" in
+        nvme*|mmcblk*|loop*) echo "p" ;;
+        *) echo "" ;;
+    esac
+}
+
+cleanup_target() {
+    if mountpoint -q "$MNT" 2>/dev/null; then
+        umount -R "$MNT" 2>/dev/null || true
     fi
+
+    if cryptsetup status "$LUKS_NAME" &>/dev/null; then
+        vgchange -an "$VG_NAME" &>/dev/null || true
+        cryptsetup close "$LUKS_NAME" &>/dev/null || true
+    fi
+}
+
+prepare_pacman_config() {
+    local config_dir
+    config_dir="$(mktemp -d)"
+    local config_file="$config_dir/pacman.conf"
+    local mirrorlist_file="$config_dir/mirrorlist"
+
+    cp /etc/pacman.conf "$config_file"
+
+    log_info "Preparing temporary pacman config for installation..."
+    if command -v reflector &>/dev/null; then
+        log_cmd "reflector --latest 20 --protocol https --sort rate --save $mirrorlist_file"
+        if ! reflector --latest 20 --protocol https --sort rate --save "$mirrorlist_file" 2>&1 | tee -a "$LOG_FILE"; then
+            log_warn "reflector failed, falling back to existing mirrorlist"
+            awk 'BEGIN{section=0} /^\[options\]/{section=1; next} /^\[/{section=0} section==0 && ($1 ~ /^#/ || $1 ~ /^Server=/) { print }' /etc/pacman.d/mirrorlist > "$mirrorlist_file"
+        fi
+    else
+        log_warn "reflector not available, using sanitized host mirrorlist"
+        awk 'BEGIN{section=0} /^\[options\]/{section=1; next} /^\[/{section=0} section==0 && ($1 ~ /^#/ || $1 ~ /^Server=/) { print }' /etc/pacman.d/mirrorlist > "$mirrorlist_file"
+    fi
+
+    if grep -q '^#Color' "$config_file"; then
+        sed -i 's/^#Color/Color/' "$config_file"
+    elif ! grep -q '^Color' "$config_file"; then
+        printf '\nColor\n' >> "$config_file"
+    fi
+
+    if grep -q '^#\[multilib\]' "$config_file"; then
+        sed -i '/^#\[multilib\]/s/^#//' "$config_file"
+    elif ! grep -q '^\[multilib\]' "$config_file"; then
+        cat >> "$config_file" <<EOF
+
+[multilib]
+Include = $mirrorlist_file
+EOF
+    fi
+
+    sed -i 's|^Include = /etc/pacman.d/mirrorlist$|Include = '
 }
 
 partition_disk() {
@@ -488,26 +611,29 @@ configure_pacman() {
         return 0
     fi
 
-    # Enable Color
-    if grep -q '^#Color' /etc/pacman.conf; then
-        sed -i 's/^#Color/Color/' /etc/pacman.conf
-    elif ! grep -q '^Color' /etc/pacman.conf; then
-        printf '\nColor\n' >> /etc/pacman.conf
+    local target_root="${1:-$MNT}"
+    local pacman_conf="$target_root/etc/pacman.conf"
+
+    if [[ ! -f "$pacman_conf" ]]; then
+        log_error "pacman.conf not found at $pacman_conf"
+        return 1
     fi
 
-    # Enable multilib
-    if grep -q '^#\[multilib\]' /etc/pacman.conf; then
-        sed -i '/^#\[multilib\]/s/^#//' /etc/pacman.conf
-        sed -i '/^#Include = \/etc\/pacman.d\/mirrorlist/s/^#//' /etc/pacman.conf
-    elif ! grep -q '^\[multilib\]' /etc/pacman.conf; then
-        cat >> /etc/pacman.conf <<'EOF'
-
-[multilib]
-Include = /etc/pacman.d/mirrorlist
-EOF
+    if grep -q '^#Color' "$pacman_conf"; then
+        sed -i 's/^#Color/Color/' "$pacman_conf"
+    elif ! grep -q '^Color' "$pacman_conf"; then
+        printf '\nColor\n' >> "$pacman_conf"
     fi
 
-    pacman -Sy --noconfirm
+    if grep -q '^#\[multilib\]' "$pacman_conf"; then
+        sed -i '/^#\[multilib\]/s/^#//' "$pacman_conf"
+    fi
+
+    if grep -q '^#Include = /etc/pacman.d/mirrorlist' "$pacman_conf"; then
+        sed -i 's|^#Include = /etc/pacman.d/mirrorlist|Include = /etc/pacman.d/mirrorlist|' "$pacman_conf"
+    elif ! grep -q '^Include = /etc/pacman.d/mirrorlist' "$pacman_conf" && grep -q '^\[multilib\]' "$pacman_conf"; then
+        printf 'Include = /etc/pacman.d/mirrorlist\n' >> "$pacman_conf"
+    fi
 
     log_success "pacman configured"
 }
@@ -520,12 +646,21 @@ configure_mirrors() {
         return 0
     fi
 
+    local mirrorlist_path="${1:-/etc/pacman.d/mirrorlist}"
+
     if command -v reflector &>/dev/null; then
-        reflector --latest 20 --protocol https --sort rate --save /etc/pacman.d/mirrorlist || true
-        log_success "Mirrorlist updated"
+        log_cmd "reflector --latest 20 --protocol https --sort rate --save $mirrorlist_path"
+        if reflector --latest 20 --protocol https --sort rate --save "$mirrorlist_path" 2>&1 | tee -a "$LOG_FILE"; then
+            log_success "Mirrorlist updated"
+            return 0
+        fi
+        log_warn "reflector failed, falling back to sanitized mirrorlist"
     else
-        log_warn "reflector not available, skipping mirror update"
+        log_warn "reflector not available, using sanitized mirrorlist"
     fi
+
+    awk 'BEGIN{section=0} /^\[options\]/{section=1; next} /^\[/{section=0} section==0 && ($1 ~ /^#/ || $1 ~ /^Server=/) { print }' /etc/pacman.d/mirrorlist > "$mirrorlist_path"
+    log_success "Mirrorlist updated"
 }
 
 install_base_system() {
@@ -536,27 +671,37 @@ install_base_system() {
         return 0
     fi
 
-    local pacman_wrapper_dir
-    pacman_wrapper_dir="$(mktemp -d)"
+    local pacman_config_dir
+    pacman_config_dir="$(mktemp -d)"
+    trap 'rm -rf "$pacman_config_dir"' RETURN
+
+    local pacman_conf_file="$pacman_config_dir/pacman.conf"
+    local mirrorlist_file="$pacman_config_dir/mirrorlist"
+    cp /etc/pacman.conf "$pacman_conf_file"
+
+    configure_mirrors "$mirrorlist_file"
+
+    if grep -q '^#Color' "$pacman_conf_file"; then
+        sed -i 's/^#Color/Color/' "$pacman_conf_file"
+    elif ! grep -q '^Color' "$pacman_conf_file"; then
+        printf '\nColor\n' >> "$pacman_conf_file"
+    fi
+
+    if grep -q '^#\[multilib\]' "$pacman_conf_file"; then
+        sed -i '/^#\[multilib\]/s/^#//' "$pacman_conf_file"
+    fi
+
+    sed -i "s|^#Include = /etc/pacman.d/mirrorlist|Include = $mirrorlist_file|" "$pacman_conf_file"
+    sed -i "s|^Include = /etc/pacman.d/mirrorlist|Include = $mirrorlist_file|" "$pacman_conf_file"
+
     mkdir -p "$MNT/var/cache/pacman/pkg"
-    cat > "$pacman_wrapper_dir/pacman" <<EOF
-#!/usr/bin/env bash
-exec /usr/bin/pacman --noconfirm --cachedir "$MNT/var/cache/pacman/pkg" "\$@"
-EOF
-    chmod +x "$pacman_wrapper_dir/pacman"
-
-    local PATH="$pacman_wrapper_dir:$PATH"
-    trap 'rm -rf "$pacman_wrapper_dir"' RETURN
-
-    configure_pacman
-    configure_mirrors
 
     # Filter available packages
     log_info "Filtering available packages..."
     local available=()
     local skipped=()
     for pkg in "${PACKAGES[@]}"; do
-        if pacman -Si "$pkg" &>/dev/null; then
+        if pacman --config "$pacman_conf_file" -Si "$pkg" &>/dev/null; then
             available+=("$pkg")
         else
             skipped+=("$pkg")
@@ -577,8 +722,10 @@ EOF
 
     log_cmd "pacstrap $MNT ${available[@]}"
     log_info "Running pacstrap with ${#available[@]} packages..."
-    pacstrap "$MNT" "${available[@]}" 2>&1 | tee -a "$LOG_FILE"
+    pacstrap -c -K -C "$pacman_conf_file" "$MNT" "${available[@]}" 2>&1 | tee -a "$LOG_FILE"
     log_result "Base system installed"
+
+    configure_pacman "$MNT"
 
     log_debug "Installed packages:"
     arch-chroot "$MNT" pacman -Q 2>&1 | tee -a "$LOG_FILE" | wc -l | xargs log_debug "Total packages installed:"
@@ -598,9 +745,8 @@ configure_locale() {
 
     echo "LANG=$LOCALE" > "$MNT/etc/locale.conf"
     arch-chroot "$MNT" /bin/bash -c "echo '$LOCALE UTF-8' >> /etc/locale.gen && locale-gen"
-    arch-chroot "$MNT" timedatectl set-timezone "$TIMEZONE"
-    arch-chroot "$MNT" timedatectl set-ntp true
-    arch-chroot "$MNT" hwclock --systohc
+    arch-chroot "$MNT" /bin/bash -c "ln -sf /usr/share/zoneinfo/$TIMEZONE /etc/localtime"
+    hwclock --systohc
 
     # Set keymap in live environment
     if [[ $DRY_RUN -eq 0 ]]; then
@@ -640,14 +786,15 @@ configure_mkinitcpio() {
         return 0
     fi
 
-    log_debug "Writing mkinitcpio.conf with LUKS and LVM hooks..."
-    cat > "$MNT/etc/mkinitcpio.conf" <<'EOF'
-MODULES=()
-BINARIES=()
-FILES=()
-HOOKS=(base udev autodetect modconf block keyboard keymap consolefont encrypt lvm2 filesystems fsck)
-COMPRESSION="zstd"
-EOF
+    if [[ ! -f "$MNT/etc/mkinitcpio.conf" ]]; then
+        log_error "mkinitcpio.conf not found in target system"
+        return 1
+    fi
+
+    log_debug "Patching mkinitcpio.conf hooks and compression..."
+    sed -i 's|^HOOKS=.*|HOOKS=(base udev autodetect modconf block keyboard keymap consolefont encrypt lvm2 filesystems fsck)|' "$MNT/etc/mkinitcpio.conf"
+    sed -i 's|^#COMPRESSION="zstd"|COMPRESSION="zstd"|' "$MNT/etc/mkinitcpio.conf"
+    sed -i 's|^COMPRESSION=.*|COMPRESSION="zstd"|' "$MNT/etc/mkinitcpio.conf"
 
     log_debug "Content of mkinitcpio.conf:"
     cat "$MNT/etc/mkinitcpio.conf" | tee -a "$LOG_FILE"
@@ -785,9 +932,31 @@ setup_snapper() {
         return 0
     fi
 
-    arch-chroot "$MNT" /bin/bash -c "snapper -c root create-config /" 2>/dev/null || true
-    arch-chroot "$MNT" /bin/bash -c "snapper -c home create-config /home" 2>/dev/null || true
-    arch-chroot "$MNT" /bin/bash -c "systemctl enable snapper-timeline.timer snapper-cleanup.timer" 2>/dev/null || true
+    if ! findmnt -no FSTYPE "$MNT" | grep -qx btrfs; then
+        log_error "$MNT is not mounted as btrfs"
+        return 1
+    fi
+
+    log_debug "Btrfs default subvolume:"
+    btrfs subvolume get-default "$MNT" 2>&1 | tee -a "$LOG_FILE" || true
+
+    log_cmd "arch-chroot $MNT snapper -c root create-config /"
+    if ! arch-chroot "$MNT" /bin/bash -c "snapper -c root create-config /" 2>&1 | tee -a "$LOG_FILE"; then
+        log_error "Failed to create snapper root config"
+        return 1
+    fi
+
+    log_cmd "arch-chroot $MNT snapper -c home create-config /home"
+    if ! arch-chroot "$MNT" /bin/bash -c "snapper -c home create-config /home" 2>&1 | tee -a "$LOG_FILE"; then
+        log_error "Failed to create snapper home config"
+        return 1
+    fi
+
+    log_cmd "arch-chroot $MNT systemctl enable snapper-timeline.timer snapper-cleanup.timer"
+    if ! arch-chroot "$MNT" /bin/bash -c "systemctl enable snapper-timeline.timer snapper-cleanup.timer" 2>&1 | tee -a "$LOG_FILE"; then
+        log_error "Failed to enable snapper timers"
+        return 1
+    fi
 
     log_success "snapper configured"
 }
@@ -796,11 +965,15 @@ enable_services() {
     log_header "Enabling system services"
 
     if [[ $DRY_RUN -eq 1 ]]; then
-        log_info "DRY-RUN: would enable NetworkManager, sshd, ufw"
+        log_info "DRY-RUN: would enable NetworkManager, bluetooth, seatd, power-profiles-daemon, sshd, ufw"
         return 0
     fi
 
-    arch-chroot "$MNT" /bin/bash -c "systemctl enable NetworkManager sshd ufw" 2>/dev/null || true
+    log_cmd "arch-chroot $MNT systemctl enable NetworkManager bluetooth seatd power-profiles-daemon sshd ufw"
+    if ! arch-chroot "$MNT" /bin/bash -c "systemctl enable NetworkManager bluetooth seatd power-profiles-daemon sshd ufw" 2>&1 | tee -a "$LOG_FILE"; then
+        log_error "Failed to enable system services"
+        return 1
+    fi
 
     log_success "Services enabled"
 }
@@ -876,6 +1049,9 @@ run_install() {
 
     log_config
 
+    cleanup_target
+    trap cleanup_target EXIT
+
     preflight_checks || return 1
 
     if [[ $ASSUME_YES -eq 0 && $DRY_RUN -eq 0 ]]; then
@@ -906,6 +1082,7 @@ run_install() {
     setup_snapper || return 1
     enable_services || return 1
 
+    cleanup_target
     log_success "Installation completed!"
     log_info "Run 'sudo $0 diagnose' after first boot to validate system"
 }
