@@ -653,9 +653,13 @@ EOF
     sed -i "s|^Include = /etc/pacman.d/mirrorlist|Include = $mirrorlist_file|" "$pacman_conf_file"
 
     mkdir -p "$MNT/var/cache/pacman/pkg"
-    # Clear potentially corrupted packages from previous runs
+    # Clear potentially corrupted packages from previous runs on target
     log_info "Clearing package cache to avoid stale/corrupted packages..."
     rm -f "$MNT/var/cache/pacman/pkg"/*.pkg.tar.* 2>/dev/null || true
+    # Free up live-ISO RAM by clearing its pacman cache
+    # (without -c, pacstrap downloads directly to $MNT, not the live ISO tmpfs)
+    log_info "Freeing live ISO package cache from RAM..."
+    rm -f /var/cache/pacman/pkg/*.pkg.tar.* 2>/dev/null || true
 
     # Filter available packages
     log_info "Filtering available packages..."
@@ -686,7 +690,7 @@ EOF
     local pacstrap_attempts=3
     local pacstrap_ok=0
     for attempt in $(seq 1 "$pacstrap_attempts"); do
-        if pacstrap -c -K -C "$pacman_conf_file" "$MNT" "${available[@]}" 2>&1 | tee -a "$LOG_FILE"; then
+        if pacstrap -K -C "$pacman_conf_file" "$MNT" "${available[@]}" 2>&1 | tee -a "$LOG_FILE"; then
             pacstrap_ok=1
             break
         fi
