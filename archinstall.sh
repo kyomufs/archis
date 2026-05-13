@@ -185,41 +185,8 @@ confirm() {
         log_info "DRY-RUN: assuming yes for: $msg"
         return 0
     fi
-    read -rp "$msg [y/N]: " yn
-    [[ "$yn" =~ [Yy] ]]
-}
-
-require_root() {
-    if [[ $EUID -ne 0 ]]; then
-        log_error "This script must be run as root"
-        exit 1
-    fi
-}
-
-log_config() {
-    log_header "Installation Configuration"
-    log_debug "DISK: $DISK"
-    log_debug "LUKS_NAME: $LUKS_NAME"
-    log_debug "VG_NAME: $VG_NAME"
-    log_debug "LV_NAME: $LV_NAME"
-    log_debug "KEYMAP: $KEYMAP"
-    log_debug "LOCALE: $LOCALE"
-    log_debug "TIMEZONE: $TIMEZONE"
-    log_debug "HOSTNAME: $HOSTNAME"
-    log_debug "USER_NAME: $USER_NAME"
-    log_debug "ZRAM_ALGORITHM: $ZRAM_ALGORITHM"
-    log_debug "FAILLOCK_DENY: $FAILLOCK_DENY"
-    log_debug "FAILLOCK_UNLOCK_TIME: $FAILLOCK_UNLOCK_TIME"
-    log_debug "MNT: $MNT"
-    log_debug "LOG_FILE: $LOG_FILE"
-    log_debug "DRY_RUN: $DRY_RUN"
-    log_debug "ASSUME_YES: $ASSUME_YES"
-}
-
-confirm() {
-    local msg="$1"
-    if [[ $DRY_RUN -eq 1 ]]; then
-        log_info "DRY-RUN: assuming yes for: $msg"
+    if [[ $ASSUME_YES -eq 1 ]]; then
+        log_info "ASSUME-YES: proceeding without prompt for: $msg"
         return 0
     fi
     read -rp "$msg [y/N]: " yn
@@ -337,7 +304,8 @@ Include = $mirrorlist_file
 EOF
     fi
 
-    sed -i 's|^Include = /etc/pacman.d/mirrorlist$|Include = '
+    sed -i "s|^#Include = /etc/pacman.d/mirrorlist|Include = $mirrorlist_file|" "$config_file"
+    sed -i "s|^Include = /etc/pacman.d/mirrorlist|Include = $mirrorlist_file|" "$config_file"
 }
 
 partition_disk() {
@@ -664,10 +632,8 @@ Include = $mirrorlist_file
 EOF
     fi
 
-    if ! grep -q '^Include = ' "$pacman_conf_file"; then
-        sed -i "s|^#Include = /etc/pacman.d/mirrorlist|Include = $mirrorlist_file|" "$pacman_conf_file"
-        sed -i "s|^Include = /etc/pacman.d/mirrorlist|Include = $mirrorlist_file|" "$pacman_conf_file"
-    fi
+    sed -i "s|^#Include = /etc/pacman.d/mirrorlist|Include = $mirrorlist_file|" "$pacman_conf_file"
+    sed -i "s|^Include = /etc/pacman.d/mirrorlist|Include = $mirrorlist_file|" "$pacman_conf_file"
 
     mkdir -p "$MNT/var/cache/pacman/pkg"
     mkdir -p "$pacman_wrapper_dir"
@@ -728,9 +694,9 @@ configure_locale() {
     fi
 
     echo "LANG=$LOCALE" > "$MNT/etc/locale.conf"
-    arch-chroot "$MNT" /bin/bash -c "echo '$LOCALE UTF-8' >> /etc/locale.gen && locale-gen"
+    arch-chroot "$MNT" /bin/bash -c "sed -i '/^$LOCALE UTF-8/d' /etc/locale.gen && echo '$LOCALE UTF-8' >> /etc/locale.gen && locale-gen"
     arch-chroot "$MNT" /bin/bash -c "ln -sf /usr/share/zoneinfo/$TIMEZONE /etc/localtime"
-    hwclock --systohc
+    arch-chroot "$MNT" /bin/bash -c "hwclock --systohc"
 
     # Set keymap in live environment
     if [[ $DRY_RUN -eq 0 ]]; then
@@ -843,10 +809,14 @@ setup_users() {
     arch-chroot "$MNT" /bin/bash -c "echo 'root:$ROOT_PASS' | chpasswd" 2>&1 | tee -a "$LOG_FILE"
     log_result "Root password set"
 
-    log_info "Creating user account: $USER_NAME"
-    log_cmd "arch-chroot $MNT useradd -m -G wheel -s /bin/bash $USER_NAME"
-    arch-chroot "$MNT" /usr/bin/useradd -m -G wheel -s /bin/bash "$USER_NAME" 2>&1 | tee -a "$LOG_FILE"
-    log_result "User $USER_NAME created"
+    if arch-chroot "$MNT" /usr/bin/id -u "$USER_NAME" &>/dev/null; then
+        log_warn "User $USER_NAME already exists, skipping useradd"
+    else
+        log_info "Creating user account: $USER_NAME"
+        log_cmd "arch-chroot $MNT useradd -m -G wheel -s /bin/bash $USER_NAME"
+        arch-chroot "$MNT" /usr/bin/useradd -m -G wheel -s /bin/bash "$USER_NAME" 2>&1 | tee -a "$LOG_FILE"
+        log_result "User $USER_NAME created"
+    fi
 
     log_info "Setting user password..."
     log_cmd "echo '$USER_NAME:***' | arch-chroot $MNT chpasswd"
