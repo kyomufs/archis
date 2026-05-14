@@ -97,6 +97,9 @@ PACKAGES=(
 
   # zram
   zram-generator
+
+  # Fonts for consolefont mkinitcpio hook (fixes "no font found in configuration" warning)
+  terminus-font
 )
 
 # Runtime
@@ -504,8 +507,11 @@ format_filesystems() {
     log_result "Snapshots mounted with subvol=@snapshots"
 
     mkdir -p "$MNT/boot"
-    log_cmd "mount $efi_part $MNT/boot"
-    if ! mount "$efi_part" "$MNT/boot" 2>&1 | tee -a "$LOG_FILE"; then
+    # Mount EFI with restricted permissions to prevent world-accessible warning from bootctl.
+    # FAT32 doesn't support Unix permissions natively, so we must pass fmask/dmask at mount time.
+    # fmask=0137 → files 640 (rw-r-----), dmask=0027 → dirs 750 (rwxr-x---)
+    log_cmd "mount -o fmask=0137,dmask=0027 $efi_part $MNT/boot"
+    if ! mount -o fmask=0137,dmask=0027 "$efi_part" "$MNT/boot" 2>&1 | tee -a "$LOG_FILE"; then
         log_error "EFI mount failed"
         return 1
     fi
@@ -540,6 +546,15 @@ generate_fstab() {
     log_debug "Removing swap entries (if any)..."
     sed '/swap/d' "$MNT/etc/fstab.tmp" > "$MNT/etc/fstab"
     rm "$MNT/etc/fstab.tmp"
+
+    # Fix /boot FAT32 permissions in fstab so they persist across reboots.
+    # Without fmask/dmask, bootctl warns: "Mount point '/boot' is world accessible (security hole)".
+    # fmask=0137 → files appear as 640 (root:root rw-r-----),
+    # dmask=0027 → dirs appear as 750 (root:root rwxr-x---)
+    if grep -q '/boot' "$MNT/etc/fstab"; then
+        sed -i '/\/boot/{/vfat/s/\(defaults\)/\1,fmask=0137,dmask=0027/}' "$MNT/etc/fstab"
+        log_debug "Patched /boot fstab entry with fmask=0137,dmask=0027"
+    fi
 
     log_debug "Generated /etc/fstab content:"
     cat "$MNT/etc/fstab" | tee -a "$LOG_FILE"
@@ -731,8 +746,13 @@ configure_locale() {
     fi
 
     echo "LANG=$LOCALE" > "$MNT/etc/locale.conf"
-    # vconsole.conf needed for consolefont/keymap mkinitcpio hooks
-    echo "KEYMAP=$KEYMAP" > "$MNT/etc/vconsole.conf"
+    # vconsole.conf: keymap + font required by consolefont mkinitcpio hook
+    # Without FONT= line, mkinitcpio emits "no font found in configuration" warning
+    {
+        echo "KEYMAP=$KEYMAP"
+        echo "FONT=ter-v18n"
+        echo "FONT_MAP=8859-2"
+    } > "$MNT/etc/vconsole.conf"
     arch-chroot "$MNT" /bin/bash -c "sed -i '/^$LOCALE UTF-8/d' /etc/locale.gen && echo '$LOCALE UTF-8' >> /etc/locale.gen && locale-gen"
     arch-chroot "$MNT" /bin/bash -c "ln -sf /usr/share/zoneinfo/$TIMEZONE /etc/localtime"
     arch-chroot "$MNT" /bin/bash -c "hwclock --systohc"
@@ -781,9 +801,26 @@ configure_mkinitcpio() {
     fi
 
     log_debug "Patching mkinitcpio.conf hooks and compression..."
-    sed -i 's|^HOOKS=.*|HOOKS=(base udev autodetect modconf block keyboard keymap consolefont encrypt lvm2 filesystems fsck)|' "$MNT/etc/mkinitcpio.conf"
+    # Hook order: base → udev → autodetect → microcode → modconf → block → keyboard → keymap
+    #             → consolefont → encrypt → lvm2 → filesystems → fsck
+    # microcode must come before modconf so CPU microcode is loaded early in initramfs.
+    # consolefont requires terminus-font installed (added to PACKAGES).
+    sed -i 's|^HOOKS=.*|HOOKS=(base udev autodetect microcode modconf block keyboard keymap consolefont encrypt lvm2 filesystems fsck)|' "$MNT/etc/mkinitcpio.conf"
     sed -i 's|^#COMPRESSION="zstd"|COMPRESSION="zstd"|' "$MNT/etc/mkinitcpio.conf"
     sed -i 's|^COMPRESSION=.*|COMPRESSION="zstd"|' "$MNT/etc/mkinitcpio.conf"
+
+    # Blacklist qat_6xxx (Intel QuickAssist Technology) — firmware not shipped in linux-firmware
+    # for consumer/laptop hardware. Without blacklisting, mkinitcpio emits:
+    # "WARNING: Possibly missing firmware for module: 'qat_6xxx'"
+    # This module is only needed on server-grade Intel QAT accelerator cards.
+    mkdir -p "$MNT/etc/modprobe.d"
+    cat > "$MNT/etc/modprobe.d/blacklist-qat.conf" <<'EOF'
+# Intel QuickAssist Technology — not present on consumer laptops.
+# Blacklisted to suppress "missing firmware for qat_6xxx" mkinitcpio warning.
+blacklist qat_6xxx
+blacklist qat_4xxx
+EOF
+    log_debug "Blacklisted qat_6xxx/qat_4xxx modules (no firmware on consumer hardware)"
 
     log_debug "Content of mkinitcpio.conf:"
     cat "$MNT/etc/mkinitcpio.conf" | tee -a "$LOG_FILE"
@@ -806,9 +843,13 @@ install_bootloader() {
     log_cmd "arch-chroot $MNT bootctl --path=/boot install"
     arch-chroot "$MNT" bootctl --path=/boot install 2>&1 | tee -a "$LOG_FILE"
     log_result "systemd-boot installed"
-    # Fix bootctl world-accessible warning: restrict /boot/loader/random-seed permissions
+
+    # FAT32 doesn't support Unix permissions natively — chmod here is runtime-only.
+    # The persistent fix is fmask=0137,dmask=0027 in /etc/fstab (applied in generate_fstab).
+    # We still chmod at install time so the live session doesn't emit the warning.
     chmod 600 "$MNT/boot/loader/random-seed" 2>/dev/null || true
     chmod 700 "$MNT/boot/loader" 2>/dev/null || true
+    log_debug "Applied runtime /boot permissions (persisted via fstab fmask/dmask)"
 
     log_info "Getting LUKS UUID for boot parameters..."
     local luks_part="${DISK}$(partition_suffix "$DISK")2"
@@ -818,13 +859,43 @@ install_bootloader() {
     mkdir -p "$MNT/boot/loader/entries"
 
     log_debug "Creating bootloader entry with encrypted root parameters..."
+    # ACPI parameters:
+    #   acpi_osi=! acpi_osi="Windows 2020"  — spoof Windows ACPI compatibility to fix BIOS
+    #     bugs like AE_ALREADY_EXISTS on \_TZ.ETMD and AE_NOT_FOUND on EC sensors (SEN2/SEN4/CHRG).
+    #     These are firmware bugs common on ASUS/ROG laptops.
+    #   acpi_backlight=native               — use native backlight driver, avoids ACPI conflicts.
+    # quiet loglevel=3 rd.udev.log_level=3  — suppress noise from ACPI firmware bugs at boot.
+    #   (errors still logged to journal; this just keeps the console clean)
+    # nvidia-drm.modeset=1                  — required for Wayland/Hyprland with NVIDIA.
     cat > "$MNT/boot/loader/entries/arch.conf" <<EOF
 title   Arch Linux
 linux   /vmlinuz-linux
 initrd  /intel-ucode.img
 initrd  /initramfs-linux.img
-options cryptdevice=UUID=$luks_uuid:$LUKS_NAME root=/dev/$VG_NAME/$LV_NAME rootflags=subvol=@ rw nvidia-drm.modeset=1
+options cryptdevice=UUID=$luks_uuid:$LUKS_NAME root=/dev/$VG_NAME/$LV_NAME rootflags=subvol=@ rw \
+nvidia-drm.modeset=1 \
+acpi_osi=! acpi_osi="Windows 2020" acpi_backlight=native \
+quiet loglevel=3 rd.udev.log_level=3
 EOF
+
+    # Create a fallback (verbose) boot entry for debugging
+    cat > "$MNT/boot/loader/entries/arch-fallback.conf" <<EOF
+title   Arch Linux (verbose/fallback)
+linux   /vmlinuz-linux
+initrd  /intel-ucode.img
+initrd  /initramfs-linux-fallback.img
+options cryptdevice=UUID=$luks_uuid:$LUKS_NAME root=/dev/$VG_NAME/$LV_NAME rootflags=subvol=@ rw \
+nvidia-drm.modeset=1
+EOF
+
+    # loader.conf: timeout + security (no editor, prevents root shell from boot menu)
+    cat > "$MNT/boot/loader/loader.conf" <<'EOF'
+default arch.conf
+timeout 3
+console-mode max
+editor  no
+EOF
+    log_debug "Created loader.conf (timeout=3, editor=no for security)"
 
     log_debug "Bootloader entry content:"
     cat "$MNT/boot/loader/entries/arch.conf" | tee -a "$LOG_FILE"
@@ -1004,10 +1075,59 @@ SNAPCFG
         mount -o noatime,compress=zstd,subvol=@snapshots "/dev/$VG_NAME/$LV_NAME" "$MNT/.snapshots" 2>&1 | tee -a "$LOG_FILE" || true
     fi
     log_info "Installing snap-pac in chroot..."
-    arch-chroot "$MNT" /bin/bash -c "pacman -S --noconfirm snap-pac" 2>&1 | tee -a "$LOG_FILE" || \
+    # Use --noconfirm and ensure the chroot pacman.conf is valid before running.
+    # The "Server= in section 'options'" warnings during snap-pac's post-install hook
+    # are caused by pacman reading a mirrorlist that got embedded in [options].
+    # We regenerate the chroot mirrorlist to ensure it's a clean Arch mirrorlist.
+    if [[ -f "$MNT/etc/pacman.d/mirrorlist" ]]; then
+        # Ensure mirrorlist has no stale/invalid content from the live ISO temp config
+        if ! grep -q '^Server\s*=' "$MNT/etc/pacman.d/mirrorlist"; then
+            log_warn "Chroot mirrorlist appears empty, copying live mirrorlist..."
+            awk '/^Server=/' /etc/pacman.d/mirrorlist > "$MNT/etc/pacman.d/mirrorlist" || true
+        fi
+    fi
+    arch-chroot "$MNT" /bin/bash -c "pacman -S --noconfirm --needed snap-pac" 2>&1 | tee -a "$LOG_FILE" || \
         log_warn "snap-pac install failed (non-fatal, automatic snapshots won't be created)"
 
     log_success "snapper configured"
+}
+
+setup_bluetooth() {
+    log_header "Configuring Bluetooth"
+
+    if [[ $DRY_RUN -eq 1 ]]; then
+        log_info "DRY-RUN: would configure bluetooth"
+        return 0
+    fi
+
+    mkdir -p "$MNT/etc/bluetooth"
+
+    # Create main.conf to fix:
+    #   "bluetoothd: Failed to set default system config for hci0"
+    # This error occurs when bluetoothd starts but finds no /etc/bluetooth/main.conf,
+    # causing it to fail applying default policies to the HCI adapter.
+    cat > "$MNT/etc/bluetooth/main.conf" <<'EOF'
+[General]
+# Friendly name for this host's Bluetooth adapter
+Name = %h
+Class = 0x000100
+DiscoverableTimeout = 0
+# Always power on BT adapter at startup (avoids need to manually rfkill unblock)
+AutoEnable = true
+Experimental = false
+
+[Policy]
+AutoEnable = true
+ReconnectUUIDs =
+ReconnectAttempts = 7
+ReconnectIntervals = 1,2,4,8,16,32,64
+
+[GATT]
+Cache = always
+KeySize = 0
+ExchangeMTU = 517
+EOF
+    log_success "Bluetooth configured (/etc/bluetooth/main.conf)"
 }
 
 enable_services() {
@@ -1026,6 +1146,7 @@ enable_services() {
 
     log_success "Services enabled"
 }
+
 
 ################################################################################
 # MAIN FLOW
@@ -1131,6 +1252,7 @@ run_install() {
     # Advanced features
     setup_zram || return 1
     setup_snapper || return 1
+    setup_bluetooth || log_warn "Bluetooth setup non-fatal, skipping"
     enable_services || return 1
 
     cleanup_target
@@ -1191,7 +1313,7 @@ run_diagnose() {
     fi
 
     # Check key packages
-    for pkg in base linux sudo systemd; do
+    for pkg in base linux sudo systemd terminus-font; do
         if pacman -Q "$pkg" &>/dev/null; then
             log_success "Package $pkg installed"
             ((passed++))
@@ -1200,6 +1322,55 @@ run_diagnose() {
             ((failed++))
         fi
     done
+
+    # Check /boot permissions (FAT32 — check via mount options)
+    if mount | grep '/boot' | grep -q 'fmask=0137'; then
+        log_success "/boot mounted with restricted permissions (fmask=0137,dmask=0027)"
+        ((passed++))
+    else
+        log_warn "/boot not mounted with fmask=0137,dmask=0027 — bootctl may warn about world-accessible /boot"
+        log_warn "Fix: add 'fmask=0137,dmask=0027' to /boot entry in /etc/fstab"
+        ((failed++))
+    fi
+
+    # Check qat_6xxx blacklist
+    if [[ -f /etc/modprobe.d/blacklist-qat.conf ]]; then
+        log_success "qat_6xxx blacklisted (no missing firmware warning in mkinitcpio)"
+        ((passed++))
+    else
+        log_warn "qat_6xxx not blacklisted — mkinitcpio may warn 'Possibly missing firmware for qat_6xxx'"
+        log_warn "Fix: echo 'blacklist qat_6xxx' > /etc/modprobe.d/blacklist-qat.conf && mkinitcpio -P"
+        ((failed++))
+    fi
+
+    # Check bluetooth config
+    if [[ -f /etc/bluetooth/main.conf ]]; then
+        log_success "Bluetooth config exists (/etc/bluetooth/main.conf)"
+        ((passed++))
+    else
+        log_warn "/etc/bluetooth/main.conf missing — bluetoothd may fail to configure hci0"
+        ((failed++))
+    fi
+
+    # Check vconsole.conf for FONT entry
+    if grep -q '^FONT=' /etc/vconsole.conf 2>/dev/null; then
+        log_success "vconsole.conf has FONT entry (consolefont hook OK)"
+        ((passed++))
+    else
+        log_warn "/etc/vconsole.conf missing FONT= line — mkinitcpio consolefont hook will warn"
+        log_warn "Fix: echo 'FONT=ter-v18n' >> /etc/vconsole.conf && mkinitcpio -P"
+        ((failed++))
+    fi
+
+    # Check ACPI kernel params
+    if grep -q 'acpi_osi' /proc/cmdline 2>/dev/null; then
+        log_success "ACPI OSI workaround active in kernel cmdline"
+        ((passed++))
+    else
+        log_warn "acpi_osi not set — ACPI BIOS errors (AE_ALREADY_EXISTS, AE_NOT_FOUND) may appear in journalctl"
+        log_warn "Fix: add 'acpi_osi=! acpi_osi=\"Windows 2020\" acpi_backlight=native' to boot options in /boot/loader/entries/arch.conf"
+        ((failed++))
+    fi
 
     log_header "Diagnostic summary"
     log_info "Passed: $passed, Failed: $failed"
