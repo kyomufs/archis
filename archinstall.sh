@@ -1,6 +1,5 @@
 #!/usr/bin/env bash
-# Arch Linux automated installer - single modular script
-# Based on arhcinst.md template
+# Arch Linux automated installer - single modular script (FIXED)
 set -euo pipefail
 
 ################################################################################
@@ -269,47 +268,6 @@ cleanup_target() {
         vgchange -an "$VG_NAME" &>/dev/null || true
         cryptsetup close "$LUKS_NAME" &>/dev/null || true
     fi
-}
-
-prepare_pacman_config() {
-    local config_dir
-    config_dir="$(mktemp -d)"
-    local config_file="$config_dir/pacman.conf"
-    local mirrorlist_file="$config_dir/mirrorlist"
-
-    cp /etc/pacman.conf "$config_file"
-
-    log_info "Preparing temporary pacman config for installation..."
-    if command -v reflector &>/dev/null; then
-        log_cmd "reflector --latest 20 --protocol https --sort rate --save $mirrorlist_file"
-        if ! reflector --latest 20 --protocol https --sort rate --save "$mirrorlist_file" 2>&1 | tee -a "$LOG_FILE"; then
-            log_warn "reflector failed, falling back to existing mirrorlist"
-            awk '/^Server=/' /etc/pacman.d/mirrorlist > "$mirrorlist_file"
-        fi
-    else
-        log_warn "reflector not available, using sanitized host mirrorlist"
-        awk '/^Server=/' /etc/pacman.d/mirrorlist > "$mirrorlist_file"
-    fi
-
-    if grep -q '^#Color' "$config_file"; then
-        sed -i 's/^#Color/Color/' "$config_file"
-    elif ! grep -q '^Color' "$config_file"; then
-        printf '\nColor\n' >> "$config_file"
-    fi
-
-    if grep -q '^#\[multilib\]' "$config_file"; then
-        sed -i '/^#\[multilib\]/s/^#//' "$config_file"
-        sed -i '/^\[multilib\]/{n; s/^#Include/Include/}' "$config_file"
-    elif ! grep -q '^\[multilib\]' "$config_file"; then
-        cat >> "$config_file" <<EOF
-
-[multilib]
-Include = $mirrorlist_file
-EOF
-    fi
-
-    sed -i "s|^#Include = /etc/pacman.d/mirrorlist|Include = $mirrorlist_file|" "$config_file"
-    sed -i "s|^Include = /etc/pacman.d/mirrorlist|Include = $mirrorlist_file|" "$config_file"
 }
 
 partition_disk() {
@@ -645,8 +603,6 @@ install_base_system() {
 
     # Update the live system mirrorlist directly so pacman.conf can keep
     # its standard "Include = /etc/pacman.d/mirrorlist" paths unchanged.
-    # Using a temp file caused Server= lines to land in [options] because
-    # mirrorlist files have no section headers of their own.
     configure_mirrors "/etc/pacman.d/mirrorlist"
 
     if grep -q '^#Color' "$pacman_conf_file"; then
@@ -673,7 +629,6 @@ install_base_system() {
     log_info "Clearing package cache to avoid stale/corrupted packages..."
     rm -f "$MNT/var/cache/pacman/pkg"/*.pkg.tar.* 2>/dev/null || true
     # Free up live-ISO RAM by clearing its pacman cache
-    # (without -c, pacstrap downloads directly to $MNT, not the live ISO tmpfs)
     log_info "Freeing live ISO package cache from RAM..."
     rm -f /var/cache/pacman/pkg/*.pkg.tar.* 2>/dev/null || true
 
@@ -813,6 +768,7 @@ configure_mkinitcpio() {
     # for consumer/laptop hardware. Without blacklisting, mkinitcpio emits:
     # "WARNING: Possibly missing firmware for module: 'qat_6xxx'"
     # This module is only needed on server-grade Intel QAT accelerator cards.
+    # *** FIX: Create blacklist BEFORE mkinitcpio runs ***
     mkdir -p "$MNT/etc/modprobe.d"
     cat > "$MNT/etc/modprobe.d/blacklist-qat.conf" <<'EOF'
 # Intel QuickAssist Technology — not present on consumer laptops.
@@ -969,6 +925,25 @@ EOF
     log_success "pam_faillock configured"
 }
 
+configure_ufw() {
+    log_header "Configuring UFW firewall"
+
+    if [[ $DRY_RUN -eq 1 ]]; then
+        log_info "DRY-RUN: would configure UFW with default deny incoming, allow outgoing, allow SSH"
+        return 0
+    fi
+
+    # Set default policies: deny incoming, allow outgoing
+    arch-chroot "$MNT" ufw default deny incoming 2>&1 | tee -a "$LOG_FILE"
+    arch-chroot "$MNT" ufw default allow outgoing 2>&1 | tee -a "$LOG_FILE"
+    # Allow SSH (port 22) so user doesn't lock themselves out
+    arch-chroot "$MNT" ufw allow ssh 2>&1 | tee -a "$LOG_FILE"
+    # Enable UFW (but not start yet, will be enabled on boot by systemd service)
+    arch-chroot "$MNT" ufw --force enable 2>&1 | tee -a "$LOG_FILE"
+
+    log_success "UFW configured (default deny incoming, allow SSH)"
+}
+
 ################################################################################
 # ADVANCED FEATURES
 ################################################################################
@@ -1011,10 +986,12 @@ setup_snapper() {
     log_debug "Btrfs default subvolume:"
     btrfs subvolume get-default "$MNT" 2>&1 | tee -a "$LOG_FILE" || true
 
+    # *** FIX: Remove old .snapshots directory BEFORE creating snapper config ***
     if mountpoint -q "$MNT/.snapshots"; then
         umount "$MNT/.snapshots" || true
     fi
     rm -rf "$MNT/.snapshots" || true
+    mkdir -p "$MNT/.snapshots"
 
     log_cmd "arch-chroot $MNT snapper -c root create-config /"
     # Use --no-dbus: snapper in chroot has no running dbus daemon
@@ -1049,9 +1026,11 @@ SNAPCFG
         log_warn "snapper root config created manually"
     fi
 
-    arch-chroot "$MNT" btrfs subvolume delete /.snapshots || true
-    mkdir -p "$MNT/.snapshots"
-    mount -a --target "$MNT/.snapshots" || mount -o noatime,compress=zstd,subvol=@snapshots "/dev/$VG_NAME/$LV_NAME" "$MNT/.snapshots" || true
+    # Ensure .snapshots is mounted correctly after config creation
+    if ! mountpoint -q "$MNT/.snapshots"; then
+        mount -o noatime,compress=zstd,subvol=@snapshots "/dev/$VG_NAME/$LV_NAME" "$MNT/.snapshots" 2>&1 | tee -a "$LOG_FILE"
+        log_result "Re-mounted .snapshots after snapper config"
+    fi
 
     log_cmd "arch-chroot $MNT snapper -c home create-config /home"
     if ! arch-chroot "$MNT" /bin/bash -c "snapper --no-dbus -c home create-config /home" 2>&1 | tee -a "$LOG_FILE"; then
@@ -1075,12 +1054,8 @@ SNAPCFG
         mount -o noatime,compress=zstd,subvol=@snapshots "/dev/$VG_NAME/$LV_NAME" "$MNT/.snapshots" 2>&1 | tee -a "$LOG_FILE" || true
     fi
     log_info "Installing snap-pac in chroot..."
-    # Use --noconfirm and ensure the chroot pacman.conf is valid before running.
-    # The "Server= in section 'options'" warnings during snap-pac's post-install hook
-    # are caused by pacman reading a mirrorlist that got embedded in [options].
-    # We regenerate the chroot mirrorlist to ensure it's a clean Arch mirrorlist.
+    # Fix mirrorlist in chroot to avoid "Server= in section [options]" warnings
     if [[ -f "$MNT/etc/pacman.d/mirrorlist" ]]; then
-        # Ensure mirrorlist has no stale/invalid content from the live ISO temp config
         if ! grep -q '^Server\s*=' "$MNT/etc/pacman.d/mirrorlist"; then
             log_warn "Chroot mirrorlist appears empty, copying live mirrorlist..."
             awk '/^Server=/' /etc/pacman.d/mirrorlist > "$MNT/etc/pacman.d/mirrorlist" || true
@@ -1146,7 +1121,6 @@ enable_services() {
 
     log_success "Services enabled"
 }
-
 
 ################################################################################
 # MAIN FLOW
@@ -1248,6 +1222,7 @@ run_install() {
     # Users and security
     setup_users || return 1
     setup_pam_faillock || return 1
+    configure_ufw || return 1    # NEW: configure UFW before enabling
 
     # Advanced features
     setup_zram || return 1
@@ -1369,6 +1344,15 @@ run_diagnose() {
     else
         log_warn "acpi_osi not set — ACPI BIOS errors (AE_ALREADY_EXISTS, AE_NOT_FOUND) may appear in journalctl"
         log_warn "Fix: add 'acpi_osi=! acpi_osi=\"Windows 2020\" acpi_backlight=native' to boot options in /boot/loader/entries/arch.conf"
+        ((failed++))
+    fi
+
+    # Check UFW status
+    if command -v ufw &>/dev/null && ufw status | grep -q "active"; then
+        log_success "UFW firewall is active"
+        ((passed++))
+    else
+        log_warn "UFW is not active or not installed"
         ((failed++))
     fi
 
