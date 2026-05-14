@@ -44,7 +44,7 @@ PACKAGES=(
   sudo git man-db man-pages
 
   # Filesystems & Encryption
-  btrfs-progs lvm2 cryptsetup snapper snap-pac
+  btrfs-progs lvm2 cryptsetup snapper
 
   # Bootloader
   efibootmgr
@@ -621,16 +621,18 @@ install_base_system() {
         return 0
     fi
 
-    local pacman_config_dir pacman_conf_file mirrorlist_file pacman_wrapper_dir
+    local pacman_config_dir pacman_conf_file
     pacman_config_dir="$(mktemp -d)"
     trap '[[ -d "${pacman_config_dir:-}" ]] && rm -rf "$pacman_config_dir"' RETURN
 
     pacman_conf_file="$pacman_config_dir/pacman.conf"
-    mirrorlist_file="$pacman_config_dir/mirrorlist"
-    pacman_wrapper_dir="$pacman_config_dir/bin"
     cp /etc/pacman.conf "$pacman_conf_file"
 
-    configure_mirrors "$mirrorlist_file"
+    # Update the live system mirrorlist directly so pacman.conf can keep
+    # its standard "Include = /etc/pacman.d/mirrorlist" paths unchanged.
+    # Using a temp file caused Server= lines to land in [options] because
+    # mirrorlist files have no section headers of their own.
+    configure_mirrors "/etc/pacman.d/mirrorlist"
 
     if grep -q '^#Color' "$pacman_conf_file"; then
         sed -i 's/^#Color/Color/' "$pacman_conf_file"
@@ -642,15 +644,11 @@ install_base_system() {
         sed -i '/^#\[multilib\]/s/^#//' "$pacman_conf_file"
         sed -i '/^\[multilib\]/{n; s/^#Include/Include/}' "$pacman_conf_file"
     elif ! grep -q '^\[multilib\]' "$pacman_conf_file"; then
-        cat >> "$pacman_conf_file" <<EOF
-
-[multilib]
-Include = $mirrorlist_file
-EOF
+        printf '\n[multilib]\nInclude = /etc/pacman.d/mirrorlist\n' >> "$pacman_conf_file"
     fi
 
-    sed -i "s|^#Include = /etc/pacman.d/mirrorlist|Include = $mirrorlist_file|" "$pacman_conf_file"
-    sed -i "s|^Include = /etc/pacman.d/mirrorlist|Include = $mirrorlist_file|" "$pacman_conf_file"
+    # Ensure all repository Include lines are uncommented (standard path only)
+    sed -i 's|^#Include = /etc/pacman.d/mirrorlist|Include = /etc/pacman.d/mirrorlist|' "$pacman_conf_file"
 
     mkdir -p "$MNT/var/cache/pacman/pkg"
     # Clear potentially corrupted packages from previous runs on target
@@ -660,6 +658,10 @@ EOF
     # (without -c, pacstrap downloads directly to $MNT, not the live ISO tmpfs)
     log_info "Freeing live ISO package cache from RAM..."
     rm -f /var/cache/pacman/pkg/*.pkg.tar.* 2>/dev/null || true
+
+    # Sync package databases with the temp config so multilib packages are visible
+    log_info "Syncing package databases..."
+    pacman --config "$pacman_conf_file" -Sy 2>&1 | tee -a "$LOG_FILE" || true
 
     # Filter available packages
     log_info "Filtering available packages..."
@@ -726,6 +728,8 @@ configure_locale() {
     fi
 
     echo "LANG=$LOCALE" > "$MNT/etc/locale.conf"
+    # vconsole.conf needed for consolefont/keymap mkinitcpio hooks
+    echo "KEYMAP=$KEYMAP" > "$MNT/etc/vconsole.conf"
     arch-chroot "$MNT" /bin/bash -c "sed -i '/^$LOCALE UTF-8/d' /etc/locale.gen && echo '$LOCALE UTF-8' >> /etc/locale.gen && locale-gen"
     arch-chroot "$MNT" /bin/bash -c "ln -sf /usr/share/zoneinfo/$TIMEZONE /etc/localtime"
     arch-chroot "$MNT" /bin/bash -c "hwclock --systohc"
@@ -936,9 +940,36 @@ setup_snapper() {
     rm -rf "$MNT/.snapshots" || true
 
     log_cmd "arch-chroot $MNT snapper -c root create-config /"
-    if ! arch-chroot "$MNT" /bin/bash -c "snapper -c root create-config /" 2>&1 | tee -a "$LOG_FILE"; then
-        log_error "Failed to create snapper root config"
-        return 1
+    # Use --no-dbus: snapper in chroot has no running dbus daemon
+    if ! arch-chroot "$MNT" /bin/bash -c "snapper --no-dbus -c root create-config /" 2>&1 | tee -a "$LOG_FILE"; then
+        log_warn "snapper --no-dbus failed, creating config manually..."
+        mkdir -p "$MNT/etc/snapper/configs"
+        cat > "$MNT/etc/snapper/configs/root" <<'SNAPCFG'
+SUBVOLUME="/"
+FSTYPE="btrfs"
+QGROUP=""
+SPACE_LIMIT="0.5"
+FREE_LIMIT="0.2"
+ALLOW_USERS=""
+ALLOW_GROUPS=""
+SYNC_ACL="no"
+BACKGROUND_COMPARISON="yes"
+NUMBER_CLEANUP="yes"
+NUMBER_MIN_AGE="1800"
+NUMBER_LIMIT="50"
+NUMBER_LIMIT_IMPORTANT="10"
+TIMELINE_CREATE="yes"
+TIMELINE_CLEANUP="yes"
+TIMELINE_MIN_AGE="1800"
+TIMELINE_LIMIT_HOURLY="10"
+TIMELINE_LIMIT_DAILY="10"
+TIMELINE_LIMIT_WEEKLY="0"
+TIMELINE_LIMIT_MONTHLY="10"
+TIMELINE_LIMIT_YEARLY="10"
+EMPTY_PRE_POST_CLEANUP="yes"
+EMPTY_PRE_POST_MIN_AGE="1800"
+SNAPCFG
+        log_warn "snapper root config created manually"
     fi
 
     arch-chroot "$MNT" btrfs subvolume delete /.snapshots || true
@@ -946,9 +977,12 @@ setup_snapper() {
     mount -a --target "$MNT/.snapshots" || mount -o noatime,compress=zstd,subvol=@snapshots "/dev/$VG_NAME/$LV_NAME" "$MNT/.snapshots" || true
 
     log_cmd "arch-chroot $MNT snapper -c home create-config /home"
-    if ! arch-chroot "$MNT" /bin/bash -c "snapper -c home create-config /home" 2>&1 | tee -a "$LOG_FILE"; then
-        log_error "Failed to create snapper home config"
-        return 1
+    if ! arch-chroot "$MNT" /bin/bash -c "snapper --no-dbus -c home create-config /home" 2>&1 | tee -a "$LOG_FILE"; then
+        log_warn "snapper --no-dbus failed for home, creating config manually..."
+        mkdir -p "$MNT/etc/snapper/configs"
+        sed 's|SUBVOLUME="/"|SUBVOLUME="/home"|' "$MNT/etc/snapper/configs/root" \
+            > "$MNT/etc/snapper/configs/home" 2>/dev/null || true
+        log_warn "snapper home config created manually"
     fi
 
     log_cmd "arch-chroot $MNT systemctl enable snapper-timeline.timer snapper-cleanup.timer"
@@ -956,6 +990,12 @@ setup_snapper() {
         log_error "Failed to enable snapper timers"
         return 1
     fi
+
+    # Install snap-pac here (not during pacstrap) so its pacman hooks
+    # run in a proper runtime environment and avoid "fatal library error, lookup self"
+    log_info "Installing snap-pac in chroot..."
+    arch-chroot "$MNT" /bin/bash -c "pacman -S --noconfirm snap-pac" 2>&1 | tee -a "$LOG_FILE" || \
+        log_warn "snap-pac install failed (non-fatal, automatic snapshots won't be created)"
 
     log_success "snapper configured"
 }
