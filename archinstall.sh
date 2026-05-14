@@ -649,6 +649,9 @@ install_base_system() {
 
     # Ensure all repository Include lines are uncommented (standard path only)
     sed -i 's|^#Include = /etc/pacman.d/mirrorlist|Include = /etc/pacman.d/mirrorlist|' "$pacman_conf_file"
+    # Strip any Include = mirrorlist lines that ended up inside [options] (broken live ISO configs)
+    awk '/^\[options\]/{in_opts=1} /^\[[^o]/{in_opts=0} !(in_opts && /^Include = \/etc\/pacman.d\/mirrorlist/)' \
+        "$pacman_conf_file" > "${pacman_conf_file}.clean" && mv "${pacman_conf_file}.clean" "$pacman_conf_file"
 
     mkdir -p "$MNT/var/cache/pacman/pkg"
     # Clear potentially corrupted packages from previous runs on target
@@ -803,6 +806,9 @@ install_bootloader() {
     log_cmd "arch-chroot $MNT bootctl --path=/boot install"
     arch-chroot "$MNT" bootctl --path=/boot install 2>&1 | tee -a "$LOG_FILE"
     log_result "systemd-boot installed"
+    # Fix bootctl world-accessible warning: restrict /boot/loader/random-seed permissions
+    chmod 600 "$MNT/boot/loader/random-seed" 2>/dev/null || true
+    chmod 700 "$MNT/boot/loader" 2>/dev/null || true
 
     log_info "Getting LUKS UUID for boot parameters..."
     local luks_part="${DISK}$(partition_suffix "$DISK")2"
@@ -993,6 +999,10 @@ SNAPCFG
 
     # Install snap-pac here (not during pacstrap) so its pacman hooks
     # run in a proper runtime environment and avoid "fatal library error, lookup self"
+    # Ensure @snapshots is mounted inside the chroot so snap-pac hook can see it
+    if ! mountpoint -q "$MNT/.snapshots"; then
+        mount -o noatime,compress=zstd,subvol=@snapshots "/dev/$VG_NAME/$LV_NAME" "$MNT/.snapshots" 2>&1 | tee -a "$LOG_FILE" || true
+    fi
     log_info "Installing snap-pac in chroot..."
     arch-chroot "$MNT" /bin/bash -c "pacman -S --noconfirm snap-pac" 2>&1 | tee -a "$LOG_FILE" || \
         log_warn "snap-pac install failed (non-fatal, automatic snapshots won't be created)"
@@ -1103,8 +1113,10 @@ run_install() {
     partition_disk || return 1
     setup_luks_lvm || return 1
     format_filesystems || return 1
-    generate_fstab || return 1
     install_base_system || return 1
+    # Generate fstab AFTER pacstrap so the 'filesystem' package
+    # doesn't conflict and create a /etc/fstab.pacnew
+    generate_fstab || return 1
 
     # System configuration
     configure_locale || return 1
