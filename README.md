@@ -1,79 +1,80 @@
-Arch Linux Automated Installer (Single Script)
+# Arch Linux Installation Script
 
-A unified, modular bash script for fully automated Arch Linux installation with LVM on LUKS encryption, Btrfs, systemd-boot, and Hyprland desktop.
+Автоматический скрипт установки Arch Linux для ноутбука ASUS TUF Gaming F15 (RTX 3050) с Hyprland.
 
-Quick Start
+## Особенности
+
+- **LUKS2 + BTRFS** с сжатием zstd
+- **Systemd-boot** с UKI (Unified Kernel Images)
+- **ZRAM swap** вместо swap partition
+- **NVIDIA Optimus** готовая конфигурация
+- **Hyprland** с базовыми keybinding'ами
+- **Snapper** для снимков BTRFS
+- **pam_faillock** для защиты от bruteforce
+- **yay** AUR helper
+
+## BTRFS Subvolumes
+
+- `@` - корневой
+- `@home` - домашний каталог
+- `@var` - для логов и кэшей
+- `@tmp` - временные файлы
+- `@log` - системные логи
+- `@snapshots` - снимки snapper
+
+## Использование
 
 ```bash
-sudo ./archinstall.sh --dry-run install    # Test mode
-sudo ./archinstall.sh --yes install        # Full installation
-sudo ./archinstall.sh diagnose             # Validate after reboot
+# Автоматический режим (все функции включены)
+sudo ./install-arch.sh
+
+# С флагами для отключения функций
+sudo ./install-arch.sh --no-luks           # Без шифрования
+sudo ./install-arch.sh --no-ufw           # Без firewall
+sudo ./install-arch.sh --no-snapper       # Без снимков
+sudo ./install-arch.sh --no-multilib      # Без multilib
+
+# Комбинирование флагов
+sudo ./install-arch.sh --no-luks --no-ufw
+
+# Переопределение параметров
+sudo ./install-arch.sh --disk /dev/sda --hostname myarch --username admin
 ```
 
-Features
+## Environment Variables
 
-✓ Automated full installation (partitioning, encryption, formatting)
-✓ LVM on LUKS encryption with secure boot parameters
-✓ Btrfs with subvolumes and zstd compression
-✓ Snapper snapshots for rollback capability
-✓ Hyprland Wayland desktop environment
-✓ NVIDIA + Intel GPU support
-✓ Zram swap for efficiency
-✓ PAM faillock security (5 attempts, 10s lockout)
-✓ Systemd-boot bootloader
-✓ Complete package ecosystem (500+ packages)
-✓ Dry-run mode for safety testing
-
-Installation
-
-1. Boot Arch ISO in UEFI mode
-2. Clone this repo or download `archinstall.sh`
-3. Edit variables if needed (disk, hostname, user, locale)
-4. Run: `sudo ./archinstall.sh --yes install`
-5. After reboot: `sudo ./archinstall.sh diagnose`
-
-Configuration
-
-Edit the top of `archinstall.sh` to customize:
-- `DISK`: Target disk device
-- `HOSTNAME`: Computer name
-- `USER_NAME`: Regular user account
-- `LOCALE`, `TIMEZONE`, `KEYMAP`: System localization
-- `ROOT_PASS`, `USER_PASS`: Account passwords
-- `ZRAM_ALGORITHM`: Swap compression (default: zstd)
-- `FAILLOCK_*`: Security lockout settings
-
-Files
-
-- `archinstall.sh`: Main unified installation script (single file, modular functions)
-- `arhcinst.md`: Detailed configuration template
-- `QUICKSTART.md`: Quick reference guide
-- `INFO.md`: Russian language information
-- `logs/`: Installation logs (auto-generated)
-
-Options
-
-```
---dry-run    Simulate without making changes
---yes        Skip all prompts (proceed with caution)
--v, --verbose Verbose output
--h, --help    Show help message
+```bash
+export USERNAME="youruser"
+export HOSTNAME="arch"
+export ROOT_PASSWORD="rootpass"
+export USER_PASSWORD="userpass"
+export LUKS_PASSWORD="lukspass"
 ```
 
-Commands
+## NVIDIA Optimus (RTX 3050)
 
+Скрипт настраивает переменные среды для Hyprland:
 ```
-prepare      Run preflight checks only
-install      Full automated installation
-diagnose     Check system health (post-install)
+LIBVA_DRIVER_NAME=nvidia
+__GLX_VENDOR_LIBRARY_NAME=nvidia
+GBM_BACKEND=nvidia-drm
+AQ_DRM_DEVICES=/dev/dri/card1:/dev/dri/card0
+nvidia-drm.modeset=1
 ```
 
-Safety
+## Логирование
 
-- Always test with `--dry-run` first
-- Verify target disk with `lsblk`
-- Installation requires root and UEFI boot
-- All data on target disk will be erased
+Все операции логируются в `/tmp/arch-install-*.log`
 
-For detailed information, see `QUICKSTART.md` or `arhcinst.md`.
+## После установки
 
+1. После перезагрузки войдите в Hyprland
+2. Установите темы: `yay -S catppuccin-mocha-gtk-theme`
+3. Настройте обои: скопируйте в `~/Изображения/`
+4. Дополнительные пакеты: `yay -S hyprpicker nwg-bar`
+
+## Требования
+
+- UEFI boot
+- Интернет соединение
+- Arch ISO (2024+)
