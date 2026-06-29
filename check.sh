@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Скрипт диагностики Arch Linux
 # Сохраняет результаты в файл check.log в текущей директории
-set -euo pipefail
+set -uo pipefail
 
 # Цвета для консоли (не пишем в лог)
 RED='\033[0;31m'
@@ -49,11 +49,11 @@ run_cmd() {
     echo ">>> $cmd" >> "$LOG_FILE"
     if eval "$cmd" >> "$LOG_FILE" 2>&1; then
         log SUCCESS "  OK: $desc"
-        ((PASSED++))
+        PASSED=$((PASSED + 1))
         return 0
     else
         log ERROR "  FAIL: $desc"
-        ((FAILED++))
+        FAILED=$((FAILED + 1))
         return 1
     fi
 }
@@ -66,11 +66,11 @@ check_condition() {
     echo ">>> $condition" >> "$LOG_FILE"
     if eval "$condition" >> "$LOG_FILE" 2>&1; then
         log SUCCESS "  OK: $desc"
-        ((PASSED++))
+        PASSED=$((PASSED + 1))
         return 0
     else
         log ERROR "  FAIL: $desc"
-        ((FAILED++))
+        FAILED=$((FAILED + 1))
         return 1
     fi
 }
@@ -83,11 +83,11 @@ check_warn() {
     echo ">>> $condition" >> "$LOG_FILE"
     if eval "$condition" >> "$LOG_FILE" 2>&1; then
         log SUCCESS "  OK: $desc"
-        ((PASSED++))
+        PASSED=$((PASSED + 1))
         return 0
     else
         log WARNING "  WARN: $desc"
-        ((WARNINGS++))
+        WARNINGS=$((WARNINGS + 1))
         return 1
     fi
 }

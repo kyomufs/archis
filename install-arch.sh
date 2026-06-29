@@ -97,12 +97,12 @@ partition_disk() {
         # LUKS partition (remaining space)
         sgdisk -n2:0:0 -t2:8300 "$DISK"
         log INFO "Creating LUKS2 container..."
-        printf '%s\n' "$LUKS_PASSWORD" | cryptsetup luksFormat --type luks2 "$DISK"2
-        printf '%s\n' "$LUKS_PASSWORD" | cryptsetup open "$DISK"2 cryptroot
+        printf '%s\n' "$LUKS_PASSWORD" | cryptsetup luksFormat --type luks2 "${DISK}2"
+        printf '%s\n' "$LUKS_PASSWORD" | cryptsetup open "${DISK}2" cryptroot
         BTRFS_DEV="/dev/mapper/cryptroot"
     else
         sgdisk -n2:0:0 -t2:8300 "$DISK"
-        BTRFS_DEV="$DISK"2
+        BTRFS_DEV="${DISK}2"
     fi
 }
 
@@ -283,7 +283,7 @@ EOF
     # Get LUKS partition UUID for boot entry
     local crypt_params=""
     if [[ "$ENABLE_LUKS" == "true" ]]; then
-        LUKS_UUID=$(blkid -s UUID -o value "${DISK}"2)
+        LUKS_UUID=$(blkid -s UUID -o value "${DISK}2")
         crypt_params="cryptdevice=UUID=${LUKS_UUID}:cryptroot:allow-discards "
     fi
 
